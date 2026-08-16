@@ -88,108 +88,72 @@ Un cambio propaga en unos 20 segundos. Durante la ventana en gris pierdes caché
 
 ## Instalación
 
+**1. Descargar y copiar las plantillas**
+
 ```bash
 sudo git clone https://github.com/BK-Modules/cf-failover.git /opt/cf-failover
 cd /opt/cf-failover
-
-sudo cp config.env.example config.env
-sudo chmod 600 config.env          # contiene el token
+sudo cp config.env.example config.env && sudo chmod 600 config.env
 sudo cp zones.conf.example zones.conf
 ```
 
-El script busca su configuración, por orden: la variable `CF_FAILOVER_HOME`, su propio directorio si contiene un `config.env`, y si no `/etc/cf-failover`. El estado va a `/var/lib/cf-failover` (ajustable con `CF_FAILOVER_STATE`).
+**2. Crear un token de Cloudflare**
 
-### 1. Crear el token de Cloudflare
+En [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) → *Create Custom Token*, con dos permisos sobre las zonas que quieras proteger: `Zone → Zone → Read` y `Zone → DNS → Edit`. Pégalo en `config.env`.
 
-En [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) → *Create Token* → *Create Custom Token*:
+**3. Escribir tus dominios**
 
-| Permiso | Nivel |
-|---|---|
-| Zone → Zone → Read | las zonas a gestionar |
-| Zone → DNS → Edit | las zonas a gestionar |
+Un dominio por línea en `zones.conf`. Nada más:
 
-Pégalo en `config.env` como `CF_API_TOKEN`.
-
-### 2. Averiguar los IDs de zona y de registro
-
-Sustituye `TU_TOKEN` y el dominio:
-
-```bash
-TOKEN=TU_TOKEN
-ZONA=ejemplo.com
-
-ZID=$(curl -s -H "Authorization: Bearer $TOKEN" \
-  "https://api.cloudflare.com/client/v4/zones?name=$ZONA" \
-  | python3 -c "import sys,json;print(json.load(sys.stdin)['result'][0]['id'])")
-echo "zone_id: $ZID"
-
-curl -s -H "Authorization: Bearer $TOKEN" \
-  "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records?per_page=100" \
-  | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-ids=[]
-for r in sorted(d['result'], key=lambda x: x['name']):
-    if r['proxied']:
-        print(f\"  {r['name']:<30} {r['type']:<6} id={r['id']}\")
-        ids.append(r['id'])
-print()
-print('linea para zones.conf:')
-print(f\"{'$ZONA'}|{'$ZID'}|\" + ','.join(ids))
-"
+```
+ejemplo.com
+otrodominio.com
 ```
 
-Te imprime la línea lista para pegar. **Revísala antes**: quita los registros que tu servidor no sepa servir directamente y el que sea *fallback origin* (ver reglas).
+No hace falta buscar IDs de nada: el script descubre solo qué registros conmutar. Coge los que estén en naranja y apunten al mismo sitio que el dominio principal, y deja en paz los que ya estén en gris y los que apunten fuera (el `webmail` o el `autodiscover` de tu proveedor de correo, por ejemplo).
 
-### 3. Comprobar que cada host se sirve sin Cloudflare
+**4. Probar y activar**
 
-Por cada host que vayas a conmutar:
+```bash
+sudo /opt/cf-failover/cf-failover.py --status    # qué ve y qué conmutaría
+sudo /opt/cf-failover/cf-failover.py --dry-run   # simulacro, sin tocar nada
+
+sudo cp systemd/cf-failover.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now cf-failover.timer
+```
+
+Empieza a vigilar cada minuto. `--status` te dice exactamente qué registros va a mover: **míralo antes de activarlo**.
+
+## Uso
+
+```bash
+cf-failover.py --status                   # estado de cada dominio
+cf-failover.py --dry-run                  # sin escribir en Cloudflare
+cf-failover.py --force-grey               # fuerza gris
+cf-failover.py --force-orange             # fuerza naranja
+cf-failover.py --force-grey --zone x.com  # limita la acción a un dominio
+```
+
+Actividad en `journalctl -u cf-failover.service`, e histórico de cambios en `/var/lib/cf-failover/transitions.log`.
+
+## Un aviso importante
+
+**En gris, el visitante llega directo a tu servidor y ese host necesita su propio certificado.** Si tienes algún subdominio en Cloudflare que tu servidor no sepa servir por sí mismo, exclúyelo en `zones.conf`:
+
+```
+ejemplo.com|interno.ejemplo.com
+```
+
+Para comprobar cualquier host antes:
 
 ```bash
 curl -sI --resolve HOST:443:127.0.0.1 https://HOST/
 ```
 
-Si devuelve `000`, tu servidor no tiene certificado para ese host y en gris fallaría el TLS: **no lo incluyas**.
+Si responde `000` no hay certificado, y en gris fallaría. Con Cloudflare delante ese fallo queda disimulado como *Error 525*, así que puede llevar roto tiempo sin que te hayas enterado.
 
-### 4. Primera ejecución
-
-```bash
-sudo /opt/cf-failover/cf-failover.py --status     # qué ve, sin tocar nada
-sudo /opt/cf-failover/cf-failover.py --dry-run    # qué haría
-sudo /opt/cf-failover/cf-failover.py              # de verdad
-```
-
-### 5. Automatizar
-
-```bash
-sudo cp systemd/cf-failover.{service,timer} /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now cf-failover.timer
-systemctl list-timers cf-failover.timer
-```
-
-## Uso
-
-```bash
-cf-failover.py                            # un ciclo (lo que hace el timer)
-cf-failover.py --status                   # estado de cada zona
-cf-failover.py --dry-run                  # sin escribir en Cloudflare
-cf-failover.py --force-grey               # fuerza gris en todas las zonas
-cf-failover.py --force-orange             # fuerza naranja en todas
-cf-failover.py --force-grey --zone x.com  # limita la acción a una zona
-```
-
-Actividad en `journalctl -u cf-failover.service`, e histórico de cambios de modo en `/var/lib/cf-failover/transitions.log`.
-
-## Las cuatro reglas
-
-**1. Lista TODOS los registros en naranja de la zona, no solo el apex.** Comparten el mismo par de IPs: dejarte `www` fuera lo deja bloqueado mientras el resto se salva.
-
-**2. Solo se conmuta un host que tu servidor sepa servir directamente.** En gris el visitante llega a tu origen y necesita un certificado propio. Un host sin vhost configurado fallará el TLS, y con Cloudflare delante el fallo queda disimulado como *Error 525*, así que puede llevar roto tiempo sin que te enteres.
-
-**3. Nunca incluyas el *fallback origin* de Cloudflare for SaaS.** Cloudflare exige que siga proxiado y la API rechaza el cambio con **error 1040**. Tampoco hace falta: solo se usa en el tramo Cloudflare→origen, que no cruza el bloqueo. Usa siempre un host dedicado (`origin.tudominio.com`) como fallback origin. **Si pones el apex, la zona entera se queda sin failover.**
-
-**4. Los dominios de terceros que apunten a ti no van en `zones.conf`.** Si hacen `CNAME` en gris a tu apex, heredan lo que haga el apex.
+*(Si usas Cloudflare for SaaS, el registro que sea fallback origin debe seguir siempre proxiado. El script lo detecta y lo excluye solo.)*
 
 ## Qué pasa si la fuente de la lista se cae
 
@@ -206,22 +170,14 @@ Se configura con `BLOCKLIST_ERROR_POLICY` en `config.env`:
 
 Ojo con no confundir dos cosas: **una lista vacía no es un error**, es el estado normal fuera de las ventanas de bloqueo. Esta política solo entra cuando la descarga falla de verdad.
 
-## Decisiones de diseño
-
-**Solo hace `PATCH` de `proxied` y `ttl`, nunca de `content`.** Si tu IP es dinámica y la mantiene otro proceso (el router, un cliente DDNS), este script no la pisa jamás.
-
-**Memoriza el par de IPs de Cloudflare mientras la zona está en naranja.** En cuanto pasa a gris esas IPs dejan de ser visibles, y sin ese dato no habría forma de saber cuándo el bloqueo se ha levantado.
-
-**Se va a gris por la lista, pero se vuelve a naranja solo con lista + sonda.** La lista `-any` recoge bloqueos de cualquier operador, así que protege también a visitantes de operadores distintos al tuyo; es deliberadamente conservadora. Invertir esa asimetría dejaría usuarios tirados.
+**No toca la IP de tus registros, solo la nube.** Si tu IP es dinámica y la mantiene el router o un cliente DDNS, este script no la pisa jamás.
 
 ## En producción
 
-Corriendo desde 2026 sobre la infraestructura de BK Modules, protegiendo entre otros:
+Corriendo sobre la infraestructura de BK Modules, protegiendo entre otros:
 
 - **[bookflowr.com](https://bookflowr.com)** — SaaS de reservas y citas online, junto con los dominios personalizados de los negocios que lo usan.
 - **[bkmodules.com](https://bkmodules.com)** — agencia y tienda de módulos PrestaShop.
-
-El caso que originó la herramienta: un domingo de agosto, dos dominios sin relación entre sí cayeron a la vez en España mientras cargaban perfectamente desde el extranjero. Compartían par de IPs de Cloudflare, y ese par estaba en la lista de bloqueo.
 
 ## Fuente de datos
 
@@ -229,19 +185,15 @@ Las listas vienen de [hayahora.futbol](https://hayahora.futbol), que monitoriza 
 
 Este proyecto no tiene relación con ese servicio; simplemente consume su lista pública.
 
-## Sobre BK Modules
+## ¿No quieres pelearte con esto? Te lo dejamos funcionando
 
-Somos una agencia técnica con dos patas que aquí se juntan:
+Si prefieres que alguien te lo monte y se olvide el tema, **[escríbenos](https://bkmodules.com)**: lo instalamos, lo configuramos con tus dominios y lo dejamos vigilando. También si tu problema es otro y sospechas que va por aquí —tu web se cae a ratos, no sabes por qué, y desde fuera de España parece que va bien.
 
-**Desarrollo PrestaShop.** Tiendas a medida, módulos propios y desarrollos concretos sobre tiendas ya en marcha. Tenemos [tienda de módulos](https://bkmodules.com) y trabajamos también sobre proyectos heredados de otros equipos.
-
-**Sistemas e infraestructura.** Servidores propios con Apache, Caddy, PHP-FPM, MariaDB y Redis: despliegues, ajuste de rendimiento, TLS y dominios personalizados, backups cifrados y monitorización. Esta herramienta salió precisamente de ahí.
-
-Si te ha resultado útil y necesitas ayuda con tu tienda o con tus servidores, escríbenos desde **[bkmodules.com](https://bkmodules.com)**.
+Somos **[BK Modules](https://bkmodules.com)**: desarrollo PrestaShop —tiendas a medida, módulos propios y nuestra [tienda de módulos](https://bkmodules.com)— y la infraestructura que las sostiene. Esta herramienta salió de administrar servidores con webs de clientes encima.
 
 ## Contribuir
 
-Issues y pull requests bienvenidos. Si te encuentras un caso que el script no cubre —otro proveedor de DNS, otra fuente de listas, otro país con bloqueos parecidos— cuéntalo en un issue: la lógica está pensada para poder generalizarse.
+Issues y pull requests bienvenidos. Si te encuentras un caso que el script no cubre —otro proveedor de DNS, otra fuente de listas, otro país con bloqueos parecidos— cuéntalo en un issue.
 
 ## Licencia
 

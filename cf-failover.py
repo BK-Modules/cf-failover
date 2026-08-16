@@ -10,7 +10,7 @@ confirma que se alcanza, vuelve a NARANJA.
 
 INVARIANTE: solo se toca el campo `proxied` (y el `ttl`) via PATCH parcial. El
 `content` del registro NUNCA se escribe, para no pisar la IP dinamica que
-actualiza el router.
+actualice el router o un cliente DDNS.
 """
 
 import argparse
@@ -24,6 +24,7 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+
 
 def resolve_base_dir():
     """
@@ -49,6 +50,13 @@ TRANSITIONS_LOG = os.path.join(STATE_DIR, "transitions.log")
 LOCK_FILE = os.path.join(STATE_DIR, "lock")
 
 CF_API = "https://api.cloudflare.com/client/v4"
+
+# Tipos de registro que apuntan a un host y por tanto pueden ir proxiados.
+SWITCHABLE_TYPES = ("A", "AAAA", "CNAME")
+
+# Cloudflare rechaza quitar la nube al registro que sea fallback origin de SSL
+# for SaaS. Se detecta por este codigo y se excluye solo a partir de entonces.
+FALLBACK_ORIGIN_ERROR = 1040
 
 POLICIES = ("hold", "probe", "orange", "grey")
 
@@ -106,29 +114,32 @@ def load_config():
 
 
 def load_zones():
-    """Formato: apex|zone_id|record_id[,record_id...]"""
+    """
+    Formato: un dominio por linea, con exclusiones opcionales tras una barra.
+
+        ejemplo.com
+        otro.com|interno.otro.com,otro-mas.otro.com
+
+    Ni zone_id ni record_id: se descubren solos contra la API.
+    """
     zones = []
     try:
         with open(ZONES_FILE, encoding="utf-8") as handle:
             for raw in handle:
-                line = raw.strip()
-                if not line or line.startswith("#"):
+                line = raw.split("#", 1)[0].strip()
+                if not line:
                     continue
                 parts = [part.strip() for part in line.split("|")]
-                if len(parts) != 3:
-                    log(f"WARN linea ignorada en zones.conf: {line}")
-                    continue
-                apex, zone_id, record_ids = parts
-                zones.append({
-                    "apex": apex,
-                    "zone_id": zone_id,
-                    "record_ids": [r.strip() for r in record_ids.split(",") if r.strip()],
-                })
+                apex = parts[0].lower()
+                excluded = set()
+                if len(parts) > 1 and parts[1]:
+                    excluded = {h.strip().lower() for h in parts[1].split(",") if h.strip()}
+                zones.append({"apex": apex, "excluded": excluded})
     except OSError as error:
         sys.exit(f"ERROR no se puede leer {ZONES_FILE}: {error}")
 
     if not zones:
-        sys.exit("ERROR no hay zonas configuradas")
+        sys.exit("ERROR no hay dominios configurados")
     return zones
 
 
@@ -141,6 +152,7 @@ def load_state():
 
 
 def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(state, handle, indent=2, sort_keys=True)
@@ -151,7 +163,8 @@ def fetch_blocklist(config):
     """
     Devuelve un set de IPs bloqueadas, o None si la respuesta no es fiable.
 
-    None significa "no se sabe" y el llamante NO debe tocar nada.
+    None significa "no se sabe" y lo que se haga entonces lo decide
+    BLOCKLIST_ERROR_POLICY.
 
     Un set VACIO si es un estado legitimo y frecuente: fuera de las ventanas de
     bloqueo no hay ninguna IP bloqueada. No se puede tratar como error, porque
@@ -164,11 +177,11 @@ def fetch_blocklist(config):
         request = urllib.request.Request(url, headers={"User-Agent": "cf-failover/1.0"})
         with urllib.request.urlopen(request, timeout=int(config["HTTP_TIMEOUT"])) as response:
             if response.status != 200:
-                log(f"WARN la lista respondio HTTP {response.status}; no se toca nada")
+                log(f"WARN la lista respondio HTTP {response.status}")
                 return None
             body = response.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, socket.timeout, OSError) as error:
-        log(f"WARN no se pudo descargar la lista ({error}); no se toca nada")
+        log(f"WARN no se pudo descargar la lista ({error})")
         return None
 
     entries = set()
@@ -179,7 +192,7 @@ def fetch_blocklist(config):
         try:
             ipaddress.ip_address(line)
         except ValueError:
-            log(f"WARN la lista trae una entrada que no es una IP ({line!r}); no se toca nada")
+            log(f"WARN la lista trae una entrada que no es una IP ({line!r})")
             return None
         entries.add(line)
 
@@ -187,6 +200,7 @@ def fetch_blocklist(config):
 
 
 def cf_request(config, method, path, payload=None):
+    """Devuelve el JSON de Cloudflare (tambien en los errores, para poder leer el codigo)."""
     url = f"{CF_API}{path}"
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(url, data=data, method=method)
@@ -196,40 +210,118 @@ def cf_request(config, method, path, payload=None):
         with urllib.request.urlopen(request, timeout=int(config["HTTP_TIMEOUT"])) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")[:300]
-        log(f"ERROR API Cloudflare {method} {path}: HTTP {error.code} {detail}")
+        try:
+            return json.loads(error.read().decode("utf-8"))
+        except (ValueError, OSError):
+            log(f"ERROR API Cloudflare {method} {path}: HTTP {error.code}")
     except (urllib.error.URLError, socket.timeout, OSError) as error:
         log(f"ERROR API Cloudflare {method} {path}: {error}")
     return None
 
 
-def get_record(config, zone_id, record_id):
-    result = cf_request(config, "GET", f"/zones/{zone_id}/dns_records/{record_id}")
+def error_codes(result):
+    if not result:
+        return []
+    return [e.get("code") for e in result.get("errors", [])]
+
+
+def get_zone_id(config, zone, entry):
+    """El id de la zona se resuelve por nombre una vez y se memoriza."""
+    if entry.get("zone_id"):
+        return entry["zone_id"]
+    result = cf_request(config, "GET", f"/zones?name={zone['apex']}")
+    if not result or not result.get("success") or not result.get("result"):
+        log(f"{zone['apex']}: no se encuentra la zona en Cloudflare (¿el token la incluye?)")
+        return None
+    entry["zone_id"] = result["result"][0]["id"]
+    return entry["zone_id"]
+
+
+def list_records(config, zone_id):
+    result = cf_request(config, "GET", f"/zones/{zone_id}/dns_records?per_page=100")
     if not result or not result.get("success"):
         return None
-    return result.get("result")
+    return result["result"]
 
 
-def set_proxied(config, zone, proxied, dry_run):
+def points_to_same_origin(record, apex, apex_origins):
+    """
+    Solo se conmutan los registros que apuntan al MISMO sitio que el dominio
+    principal: registros A/AAAA con su misma IP, o CNAME dentro de la propia zona.
+
+    Un `webmail` o un `autodiscover` que sean CNAME al proveedor de correo apuntan
+    a un servidor ajeno: quitarles la nube los mandaria directos a un origen que
+    quiza no tenga certificado para ese nombre. No son cosa nuestra.
+    """
+    if record["type"] in ("A", "AAAA"):
+        return record["content"] in apex_origins
+    target = record["content"].lower().rstrip(".")
+    return target == apex or target.endswith("." + apex)
+
+
+def select_records(zone, entry, records):
+    """
+    Que registros conmutar.
+
+    En NARANJA se descubren solos: los proxiados de la zona que apuntan al mismo
+    origen, menos las exclusiones. En GRIS ya no se distinguen de los que el
+    usuario quiere grises a proposito, asi que se usa la lista memorizada.
+    """
+    skip = set(entry.get("skip", []))
+    excluded = zone["excluded"]
+    apex = zone["apex"]
+    apex_origins = {
+        r["content"] for r in records
+        if r["name"].lower() == apex and r["type"] in ("A", "AAAA")
+    }
+
+    candidates = [
+        r for r in records
+        if r["type"] in SWITCHABLE_TYPES
+        and r["name"].lower() not in excluded
+        and r["id"] not in skip
+        and points_to_same_origin(r, apex, apex_origins)
+    ]
+
+    proxied = [r for r in candidates if r.get("proxied")]
+    if proxied:
+        entry["record_ids"] = [r["id"] for r in proxied]
+        return proxied, True
+
+    remembered = set(entry.get("record_ids", []))
+    return [r for r in candidates if r["id"] in remembered], False
+
+
+def set_proxied(config, zone_id, records, entry, proxied, dry_run):
     """PATCH parcial: solo `proxied` y `ttl`. Nunca se envia `content`."""
     ttl = 1 if proxied else int(config["GREY_TTL"])
     payload = {"proxied": proxied, "ttl": ttl}
-    ok = True
-    for record_id in zone["record_ids"]:
+    changed = False
+    for record in records:
         if dry_run:
-            log(f"  [dry-run] PATCH {zone['apex']} record={record_id} proxied={proxied} ttl={ttl}")
+            log(f"  [dry-run] {record['name']} -> proxied={proxied} ttl={ttl}")
+            changed = True
             continue
-        result = cf_request(config, "PATCH", f"/zones/{zone['zone_id']}/dns_records/{record_id}", payload)
-        if not result or not result.get("success"):
-            log(f"  ERROR no se pudo cambiar el registro {record_id} de {zone['apex']}")
-            ok = False
+        result = cf_request(config, "PATCH", f"/zones/{zone_id}/dns_records/{record['id']}", payload)
+        if result and result.get("success"):
+            log(f"  {record['name']} -> proxied={proxied} ttl={ttl}")
+            changed = True
+        elif FALLBACK_ORIGIN_ERROR in error_codes(result):
+            # Es el fallback origin de SSL for SaaS: debe seguir proxiado siempre.
+            # No es un fallo que reintentar, asi que se excluye de aqui en adelante.
+            entry.setdefault("skip", [])
+            if record["id"] not in entry["skip"]:
+                entry["skip"].append(record["id"])
+            entry["record_ids"] = [i for i in entry.get("record_ids", []) if i != record["id"]]
+            log(f"  {record['name']}: es el fallback origin de Cloudflare for SaaS, "
+                f"debe seguir proxiado; se excluye")
         else:
-            log(f"  registro {result['result']['name']} -> proxied={proxied} ttl={ttl}")
-    return ok
+            log(f"  ERROR no se pudo cambiar {record['name']}")
+    return changed
 
 
 def resolve_public(config, hostname):
-    """Resuelve contra un resolver publico (no el del sistema, que puede cachear distinto)."""
+    """Resuelve contra un resolver publico (el del sistema puede cachear distinto)."""
     try:
         output = subprocess.run(
             ["dig", "+short", f"@{config['RESOLVER']}", hostname, "A"],
@@ -258,46 +350,73 @@ def tcp_reachable(address, timeout):
         return False
 
 
+def zone_snapshot(config, zone, state):
+    """Lee de Cloudflare, en una sola llamada, todo lo que hace falta de una zona."""
+    entry = state.setdefault(zone["apex"], {"cf_ips": [], "clear_streak": 0})
+
+    zone_id = get_zone_id(config, zone, entry)
+    if not zone_id:
+        return None
+
+    records = list_records(config, zone_id)
+    if records is None:
+        log(f"{zone['apex']}: no se pudieron leer los registros; se omite este ciclo")
+        return None
+
+    managed, proxied = select_records(zone, entry, records)
+    if not managed:
+        log(f"{zone['apex']}: no hay registros que conmutar")
+        return None
+
+    origin_ips = {r["content"] for r in managed if r["type"] in ("A", "AAAA")}
+    return {"entry": entry, "zone_id": zone_id, "records": managed,
+            "proxied": proxied, "origin_ips": origin_ips}
+
+
+def remember_cf_ips(config, zone, snap):
+    """
+    En naranja lo que resuelve son las IPs anycast de la zona: se memorizan,
+    porque en gris dejan de ser visibles y sin ellas no se sabe cuando volver.
+    """
+    resolved = [ip for ip in resolve_public(config, zone["apex"]) if ip not in snap["origin_ips"]]
+    if resolved and sorted(resolved) != sorted(snap["entry"].get("cf_ips", [])):
+        log(f"{zone['apex']}: IPs de Cloudflare -> {', '.join(sorted(resolved))}")
+    if resolved:
+        snap["entry"]["cf_ips"] = resolved
+
+
+def probe_unreachable(config, cf_ips):
+    timeout = int(config["PROBE_TIMEOUT"])
+    return [ip for ip in cf_ips if not tcp_reachable(ip, timeout)]
+
+
 def process_zone(config, zone, blocklist, state, dry_run):
     apex = zone["apex"]
-    entry = state.setdefault(apex, {"cf_ips": [], "clear_streak": 0})
-
-    record = get_record(config, zone["zone_id"], zone["record_ids"][0])
-    if record is None:
-        log(f"{apex}: no se pudo leer el estado en Cloudflare; se omite este ciclo")
+    snap = zone_snapshot(config, zone, state)
+    if snap is None:
         return
-    proxied = bool(record.get("proxied"))
-    origin_ip = record.get("content", "")
-    mode = "naranja" if proxied else "gris"
+    entry = snap["entry"]
 
-    if proxied:
-        # En naranja lo que resuelve son las IPs anycast de la zona: se memorizan,
-        # porque en gris dejan de ser visibles y sin ellas no se sabe cuando volver.
-        resolved = [ip for ip in resolve_public(config, apex) if ip != origin_ip]
-        if resolved:
-            if sorted(resolved) != sorted(entry.get("cf_ips", [])):
-                log(f"{apex}: par de IPs de Cloudflare actualizado -> {', '.join(sorted(resolved))}")
-            entry["cf_ips"] = resolved
+    if snap["proxied"]:
+        remember_cf_ips(config, zone, snap)
 
     cf_ips = entry.get("cf_ips", [])
     if not cf_ips:
-        log(f"{apex}: modo {mode}, aun no se conoce su par de IPs de Cloudflare; se omite")
+        log(f"{apex}: aun no se conoce su par de IPs de Cloudflare; se omite")
         return
 
     blocked = sorted(ip for ip in cf_ips if ip in blocklist)
 
     if blocked:
         entry["clear_streak"] = 0
-        if proxied:
-            if set_proxied(config, zone, False, dry_run):
+        if snap["proxied"]:
+            if set_proxied(config, snap["zone_id"], snap["records"], entry, False, dry_run):
                 log_transition(f"{apex}: BLOQUEADA ({', '.join(blocked)}) -> pasa a GRIS")
-            else:
-                log(f"{apex}: BLOQUEADA ({', '.join(blocked)}) pero NO se pudo pasar a gris")
         else:
             log(f"{apex}: sigue bloqueada ({', '.join(blocked)}), se mantiene en gris")
         return
 
-    if proxied:
+    if snap["proxied"]:
         entry["clear_streak"] = 0
         log(f"{apex}: naranja y sin bloqueo ({', '.join(cf_ips)})")
         return
@@ -311,69 +430,57 @@ def process_zone(config, zone, blocklist, state, dry_run):
         return
 
     if config["PROBE_ENABLED"] == "1":
-        timeout = int(config["PROBE_TIMEOUT"])
-        unreachable = [ip for ip in cf_ips if not tcp_reachable(ip, timeout)]
+        unreachable = probe_unreachable(config, cf_ips)
         if unreachable:
             entry["clear_streak"] = 0
-            log(f"{apex}: la lista la da libre pero la sonda no alcanza {', '.join(unreachable)}; sigue en gris")
+            log(f"{apex}: libre en la lista pero la sonda no alcanza {', '.join(unreachable)}; sigue en gris")
             return
 
-    if set_proxied(config, zone, True, dry_run):
+    if set_proxied(config, snap["zone_id"], snap["records"], entry, True, dry_run):
         log_transition(f"{apex}: LIBRE ({', '.join(cf_ips)}) -> vuelve a NARANJA")
         entry["clear_streak"] = 0
-    else:
-        log(f"{apex}: libre pero NO se pudo volver a naranja; se reintenta el proximo ciclo")
 
 
 def process_zone_offline(config, zone, state, dry_run):
     """
     Ciclo cuando la lista no esta disponible. Que hacer lo decide
-    BLOCKLIST_ERROR_POLICY, porque la respuesta correcta depende de la
-    instalacion: 'hold' no toca nada, 'probe' decide con la sonda TCP local,
-    'orange'/'grey' fuerzan un modo fijo.
+    BLOCKLIST_ERROR_POLICY: 'probe' usa solo la sonda TCP local, 'orange'/'grey'
+    fuerzan un modo fijo. ('hold' no llega hasta aqui.)
     """
     policy = config["BLOCKLIST_ERROR_POLICY"]
     apex = zone["apex"]
-    entry = state.setdefault(apex, {"cf_ips": [], "clear_streak": 0})
-
-    record = get_record(config, zone["zone_id"], zone["record_ids"][0])
-    if record is None:
-        log(f"{apex}: no se pudo leer el estado en Cloudflare; se omite este ciclo")
+    snap = zone_snapshot(config, zone, state)
+    if snap is None:
         return
-    proxied = bool(record.get("proxied"))
+    entry = snap["entry"]
 
     if policy == "orange":
-        if not proxied and set_proxied(config, zone, True, dry_run):
+        if not snap["proxied"] and set_proxied(config, snap["zone_id"], snap["records"], entry, True, dry_run):
             log_transition(f"{apex}: sin lista, politica 'orange' -> vuelve a NARANJA")
         return
 
     if policy == "grey":
-        if proxied and set_proxied(config, zone, False, dry_run):
+        if snap["proxied"] and set_proxied(config, snap["zone_id"], snap["records"], entry, False, dry_run):
             log_transition(f"{apex}: sin lista, politica 'grey' -> pasa a GRIS")
         return
 
-    # policy == "probe": la sonda local pasa a ser la unica señal.
-    if proxied:
-        origin_ip = record.get("content", "")
-        resolved = [ip for ip in resolve_public(config, apex) if ip != origin_ip]
-        if resolved:
-            entry["cf_ips"] = resolved
+    if snap["proxied"]:
+        remember_cf_ips(config, zone, snap)
 
     cf_ips = entry.get("cf_ips", [])
     if not cf_ips:
         log(f"{apex}: sin lista y sin par de IPs memorizado; no se toca nada")
         return
 
-    timeout = int(config["PROBE_TIMEOUT"])
-    unreachable = [ip for ip in cf_ips if not tcp_reachable(ip, timeout)]
+    unreachable = probe_unreachable(config, cf_ips)
 
     if unreachable:
         entry["clear_streak"] = 0
-        if proxied and set_proxied(config, zone, False, dry_run):
+        if snap["proxied"] and set_proxied(config, snap["zone_id"], snap["records"], entry, False, dry_run):
             log_transition(f"{apex}: sin lista, la sonda no alcanza {', '.join(unreachable)} -> pasa a GRIS")
         return
 
-    if proxied:
+    if snap["proxied"]:
         entry["clear_streak"] = 0
         log(f"{apex}: sin lista, naranja y la sonda alcanza sus IPs")
         return
@@ -384,47 +491,51 @@ def process_zone_offline(config, zone, state, dry_run):
         log(f"{apex}: sin lista, la sonda alcanza sus IPs ({entry['clear_streak']}/{needed} confirmaciones)")
         return
 
-    if set_proxied(config, zone, True, dry_run):
+    if set_proxied(config, snap["zone_id"], snap["records"], entry, True, dry_run):
         log_transition(f"{apex}: sin lista, la sonda alcanza {', '.join(cf_ips)} -> vuelve a NARANJA")
         entry["clear_streak"] = 0
 
 
 def command_status(config, zones, state):
     for zone in zones:
-        apex = zone["apex"]
-        record = get_record(config, zone["zone_id"], zone["record_ids"][0])
-        mode = "desconocido"
-        if record is not None:
-            mode = "NARANJA" if record.get("proxied") else "GRIS"
-        entry = state.get(apex, {})
+        snap = zone_snapshot(config, zone, state)
+        if snap is None:
+            print(f"{zone['apex']:<24} (no se pudo consultar)")
+            continue
+        entry = snap["entry"]
+        mode = "NARANJA" if snap["proxied"] else "GRIS"
         cf_ips = ", ".join(entry.get("cf_ips", [])) or "(sin memorizar)"
-        print(f"{apex:<20} modo={mode:<9} registros={len(zone['record_ids'])} "
-              f"ips_cloudflare=[{cf_ips}] racha_libre={entry.get('clear_streak', 0)}")
+        names = ", ".join(sorted(r["name"] for r in snap["records"]))
+        print(f"{zone['apex']:<24} {mode:<8} ips=[{cf_ips}]")
+        print(f"{'':<24} conmuta: {names}")
 
 
-def command_force(config, zones, proxied, dry_run):
+def command_force(config, zones, state, proxied, dry_run):
     for zone in zones:
-        log_transition(f"{zone['apex']}: forzado manual -> {'NARANJA' if proxied else 'GRIS'}")
-        set_proxied(config, zone, proxied, dry_run)
+        snap = zone_snapshot(config, zone, state)
+        if snap is None:
+            continue
+        if set_proxied(config, snap["zone_id"], snap["records"], snap["entry"], proxied, dry_run):
+            log_transition(f"{zone['apex']}: forzado manual -> {'NARANJA' if proxied else 'GRIS'}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Conmuta el proxy de Cloudflare segun la lista de IPs bloqueadas")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--status", action="store_true", help="muestra el estado actual y sale")
-    group.add_argument("--force-grey", action="store_true", help="fuerza gris en todas las zonas")
-    group.add_argument("--force-orange", action="store_true", help="fuerza naranja en todas las zonas")
+    group.add_argument("--force-grey", action="store_true", help="fuerza gris")
+    group.add_argument("--force-orange", action="store_true", help="fuerza naranja")
     parser.add_argument("--dry-run", action="store_true", help="no escribe en Cloudflare, solo informa")
-    parser.add_argument("--zone", metavar="APEX", help="limita la accion a una zona de zones.conf")
+    parser.add_argument("--zone", metavar="DOMINIO", help="limita la accion a un dominio de zones.conf")
     args = parser.parse_args()
 
     config = load_config()
     zones = load_zones()
 
     if args.zone:
-        zones = [zone for zone in zones if zone["apex"] == args.zone]
+        zones = [z for z in zones if z["apex"] == args.zone.lower()]
         if not zones:
-            sys.exit(f"ERROR la zona {args.zone} no esta en {ZONES_FILE}")
+            sys.exit(f"ERROR el dominio {args.zone} no esta en {ZONES_FILE}")
 
     os.makedirs(STATE_DIR, exist_ok=True)
     lock = open(LOCK_FILE, "w", encoding="utf-8")
@@ -438,10 +549,13 @@ def main():
 
     if args.status:
         command_status(config, zones, state)
+        save_state(state)
         return 0
 
     if args.force_grey or args.force_orange:
-        command_force(config, zones, args.force_orange, args.dry_run)
+        command_force(config, zones, state, args.force_orange, args.dry_run)
+        if not args.dry_run:
+            save_state(state)
         return 0
 
     blocklist = fetch_blocklist(config)
@@ -450,10 +564,10 @@ def main():
         policy = config["BLOCKLIST_ERROR_POLICY"]
         if policy == "hold":
             log("lista no disponible y politica 'hold': no se toca nada")
-        else:
-            log(f"lista no disponible; se aplica la politica '{policy}'")
-            for zone in zones:
-                process_zone_offline(config, zone, state, args.dry_run)
+            return 0
+        log(f"lista no disponible; se aplica la politica '{policy}'")
+        for zone in zones:
+            process_zone_offline(config, zone, state, args.dry_run)
     else:
         for zone in zones:
             process_zone(config, zone, blocklist, state, args.dry_run)
