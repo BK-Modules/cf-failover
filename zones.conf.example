@@ -1,0 +1,30 @@
+# Copiar a zones.conf y ajustar.
+#
+# Formato:  apex|zone_id|record_id[,record_id...]
+#
+# En el README esta el comando para sacar zone_id y los record_id de cada zona.
+
+# --- REGLAS QUE NO SE PUEDEN SALTAR (cada una costo una caida o un fallo mudo) ---
+#
+# 1. TODOS los registros en naranja de la zona, no solo el apex.
+#    Los registros de una misma zona comparten el mismo par de IPs anycast, asi
+#    que dejarse `www` o un subdominio lo deja bloqueado mientras el resto se salva.
+#
+# 2. Solo se conmuta un host que tu servidor sepa servir DIRECTAMENTE.
+#    En gris el visitante llega a tu origen y necesita certificado propio; un host
+#    sin vhost/bloque configurado fallara el TLS. Comprobacion previa:
+#        curl -sI --resolve HOST:443:127.0.0.1 https://HOST/
+#    Un codigo 000 significa que no hay certificado: NO lo pongas aqui.
+#
+# 3. NUNCA incluir el registro que sea *fallback origin* de Cloudflare for SaaS.
+#    Debe seguir proxiado siempre y la API lo rechaza con error 1040. Tampoco hace
+#    falta: solo lo usa Cloudflare en el tramo borde->origen, que no pasa por el
+#    bloqueo de los operadores. Usa un host dedicado (origin.tudominio.com) como
+#    fallback origin, nunca el apex; si es el apex, la zona entera se queda sin
+#    failover porque el apex deja de poder conmutarse.
+#
+# 4. Los dominios de terceros que apunten a ti NO van aqui: si son CNAME en gris
+#    a tu apex, heredan automaticamente lo que haga el apex.
+
+ejemplo.com|0123456789abcdef0123456789abcdef|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+otrodominio.com|fedcba9876543210fedcba9876543210|cccccccccccccccccccccccccccccccc

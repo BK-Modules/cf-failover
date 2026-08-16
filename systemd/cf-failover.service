@@ -1,0 +1,11 @@
+[Unit]
+Description=Conmuta el proxy de Cloudflare segun la lista de IPs bloqueadas por los ISP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/cf-failover/cf-failover.py
+User=root
+# Margen amplio: la resolucion DNS y la API pueden tardar en redes lentas.
+TimeoutStartSec=90

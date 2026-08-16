@@ -1,0 +1,6 @@
+# Configuracion real: contiene el token de Cloudflare y los IDs de tus zonas.
+config.env
+zones.conf
+
+__pycache__/
+*.pyc

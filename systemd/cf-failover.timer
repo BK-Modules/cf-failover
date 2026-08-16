@@ -1,0 +1,11 @@
+[Unit]
+Description=Chequeo cada minuto de la lista de IPs bloqueadas
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=cf-failover.service
+
+[Install]
+WantedBy=timers.target
